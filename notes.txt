@@ -1,0 +1,59 @@
+
+KV-cache can be used to efficiently compute "attention" in an auto-regressive transformer. The result would be extermely fast token generation. However, the first token will take sufficient time to be generated because we are warming up the matrices by performing attention computation. Subsequent ones should be exponentially faster due to caching.
+
+Multi-request batching
+
+	Usually when we are processing multiple prompts from users, we have a choice of whether to prioritize latency or throughput.
+
+	The default way is to process them normally, i.e., throughput will not be faster/better, but latency will be fantastic.
+
+	If we want to prioritize throughput, we can wait until the system has sufficient requests, and then process them. But there's a catch here. All user requests do not come at the same time, there will be some delay between them. We will have to pre-process these requests by adding padding values to their prompts. Then we can pass it our LLM which internally can perform matrix multiplication and attention calculation efficiently on multiple requests.
+
+	One practical observation is, as we increase batch size, the throughput definitely increases. And latency decreases. But the throughput increases faster than latency decreases. Therefore it is always better to have some amount of batching until we are convinced that the latency is good-enough.
+
+Continuous Batching
+
+	The "batch" of requests is not static. We batch lets say 2 requests. Before both of them are completed, if we get more requests due to high demand of our LLM application, we add more requests into the batch, or maybe even pause processing some old requests and reallocate compute to newer requests. This dynamic handling will improve both latency and throughput. However, you need to be able to tune your system based on usage patterns.
+
+Quantization
+
+	Compressing large models to be able to run on commodity hardware.
+
+	Floating point representations:
+
+		FP32 (default)
+
+			1 sign + 8 exponent + 23 mantissa bits
+
+		FP16
+
+			1 sign + 5 exponent + 10 mantissa bits
+
+		BF16 (google brain/deepmind developed)
+
+			1 sign + 8 exponent + 7 mantissa bits
+
+		FP8
+
+			1 sign + 5 exponent + 2 mantissa bits
+
+	Note: We will not blindly chop-off decimal places. Instead, we will compute some metadata (such as scale and zero_point) using which we can restore back the original decimal representation
+
+		Scale = (Max tensor value - Min tensor value) / 255
+
+			Instead of 255 you can use whatever value you want, but it will impact the amount of information you are willing to sacrifice
+
+		Zero point = Min tensor value
+
+LoRA (Low Rank Adaptation)
+
+	In fine-tuning, i.e., we are trying to customize LLM weights to our needs, what we are actually doing is updating the weights during a backward pass (similar to backprop algorithm)
+
+	For a given input, we generate an output from the vanilla LLM. If the output is different than the one we expected, we calculate the difference, and backpropagate the gradients. We do this repeatedly on our dataset until we are satisfied with the LLM output.
+
+	LoRA, is a specialized form of fine-tuning wherein we only update a select set of weights instead of all of them. These weights can be specific to attention-blocks of LLM, or some handpicked layers of the network. This way, we only have to capture these specific weights which are going to updated as part of our backward pass. Not only is the fine-tuning faster, but we can also consume less space to store our fine-tuned weights. In practicse these weights are typically 1-2% of the entire weights.
+
+	Depending on the user's request we can dynamically swap the LoRA adapters (the fine-tuned weights) to achieve desired results
+
+	Multi-LoRA inference: In an enterprise we can let several teams/orgs fine-tune their specific LoRA adapters and use just a single base model. We are essentially exploiting the small footprint of the model. 
+
