@@ -1,6 +1,56 @@
 
 KV-cache can be used to efficiently compute "attention" in an auto-regressive transformer. The result would be extermely fast token generation. However, the first token will take sufficient time to be generated because we are warming up the matrices by performing attention computation. Subsequent ones should be exponentially faster due to caching.
 
+	In autoregressive generation, the model predicts one token at a time. Without KV-cache, here's what happens:
+
+	Generating: "The cat sat on the"
+
+	Step 1: Process ["The"]                    → predict "cat"
+	Step 2: Process ["The", "cat"]             → predict "sat"  
+	Step 3: Process ["The", "cat", "sat"]      → predict "on"
+	Step 4: Process ["The", "cat", "sat", "on"] → predict "the"
+
+	What KV-Cache Actually Caches:
+
+	In the attention mechanism, each token gets transformed into three vectors:
+
+		Token → [Query (Q), Key (K), Value (V)]
+
+	The attention formula is:
+
+		Attention(Q, K, V) = softmax(Q × K^T / √d) × V
+
+	The key insight: K and V for previous tokens never change. Only the new token needs fresh Q, K, V computation.
+
+	With KV-Cache: The Efficient Way:
+
+		Step 1: Compute K₁, V₁ for "The"      → Cache them → predict "cat"
+		Step 2: Compute K₂, V₂ for "cat"      → Cache them → predict "sat"
+		        (Reuse K₁, V₁ from cache)
+		Step 3: Compute K₃, V₃ for "sat"      → Cache them → predict "on"
+		        (Reuse K₁, V₁, K₂, V₂)
+		...
+
+	Why First Token is Slow (Prefill Phase)
+
+		Prompt: "Explain quantum computing in simple terms"
+
+		PREFILL PHASE (slow):
+		┌────────────────────────────────────────────────┐
+		│ Process ALL 6 tokens in parallel               │
+		│ Build initial KV-cache for entire prompt       │
+		│ Full attention: O(n²) where n = prompt length  │
+		└────────────────────────────────────────────────┘
+		         ↓
+		    First token generated
+		         ↓
+		DECODE PHASE (fast):
+		┌────────────────────────────────────────────────┐
+		│ Process 1 token at a time                      │
+		│ Attention cost: O(n) per token                 │
+		│ Cache grows incrementally                      │
+		└────────────────────────────────────────────────┘
+
 Multi-request batching
 
 	Usually when we are processing multiple prompts from users, we have a choice of whether to prioritize latency or throughput.
@@ -9,11 +59,25 @@ Multi-request batching
 
 	If we want to prioritize throughput, we can wait until the system has sufficient requests, and then process them. But there's a catch here. All user requests do not come at the same time, there will be some delay between them. We will have to pre-process these requests by adding padding values to their prompts. Then we can pass it our LLM which internally can perform matrix multiplication and attention calculation efficiently on multiple requests.
 
+		Note: Padding in LLM batching refers to adding placeholder tokens to shorter sequences so that all sequences in a batch have the same length. It's needed because matrix operations require uniform dimensions.
+
+			Request 1: "Hello world"        -> [Hello, world, PAD, PAD, PAD]
+			Request 2: "How are you today"  -> [How, are, you, today, PAD]
+			Request 3: "What is the weather" -> [What, is, the, weather, ?]
+
+		The tradeoff: Padding wastes computation. The GPU still processes those PAD tokens even though they contribute nothing meaningful. This is why techniques like dynamic batching (grouping similarly-sized requests) and attention masking (telling the model to ignore padding positions) are used to mitigate the overhead.
+
 	One practical observation is, as we increase batch size, the throughput definitely increases. And latency decreases. But the throughput increases faster than latency decreases. Therefore it is always better to have some amount of batching until we are convinced that the latency is good-enough.
 
-Continuous Batching
+Why we want to batch LLM requests (unlike traditional internet/microservices architecture)
 
-	The "batch" of requests is not static. We batch lets say 2 requests. Before both of them are completed, if we get more requests due to high demand of our LLM application, we add more requests into the batch, or maybe even pause processing some old requests and reallocate compute to newer requests. This dynamic handling will improve both latency and throughput. However, you need to be able to tune your system based on usage patterns.
+	- GPU economics. A single LLM request drastically underutilizes the GPU. Modern GPUs have thousands of cores designed for parallel computation. Processing one request at a time means most of that expensive hardware sits idle. The marginal cost of adding more requests to a batch is surprisingly low because you're filling unused capacity.
+	
+	- The latency hit is often acceptable. Unlike a database lookup that takes 5ms, LLM inference already takes hundreds of milliseconds to seconds. Adding 50ms of batching delay to a 2-second generation is a 2.5% increase. Adding 50ms to a 5ms database query is a 1000% increase. The relative penalty is much smaller.
+	
+	- Memory bandwidth is the real bottleneck. During inference, loading model weights from GPU memory dominates the time. This cost is paid once per batch regardless of batch size. So processing 8 requests takes only slightly longer than processing 1, but gives you 8x the throughput.
+	
+	- Cost pressure is intense. GPU time is expensive. If you can serve 8 users in nearly the time it takes to serve 1, your cost per request drops dramatically. At scale, this is the difference between a viable product and burning money.
 
 Quantization
 
@@ -45,15 +109,60 @@ Quantization
 
 		Zero point = Min tensor value
 
-LoRA (Low Rank Adaptation)
+	Example
+
+		Original FP32 Weights - Say we have a tensor with these values:
+
+			[-0.8, 0.2, 1.5, -0.3, 0.9]
+
+		Step 1: Calculate Scale and Zero Point
+
+			Min = -0.8
+			Max = 1.5
+
+			Scale = (1.5 - (-0.8)) / 255
+			      = 2.3 / 255
+			      = 0.00902
+      
+			Zero Point = -0.8
+
+		Step 2: Quantize (FP32 → INT8)
+
+			Formula: quantized_value = round((original - zero_point) / scale)
+
+			-0.8 → round((-0.8 - (-0.8)) / 0.00902) = round(0)     = 0
+			 
+			 0.2 → round((0.2 - (-0.8)) / 0.00902)  = round(110.9) = 111
+			 
+			 // ... etc
+			 
+			 0.9 → round((0.9 - (-0.8)) / 0.00902)  = round(188.5) = 189
+
+			Quantized tensor: [0, 111, 255, 55, 189] (stored as uint8)
+
+		Step 3: Dequantize (INT8 → FP32)
+
+			Formula: reconstructed = (quantized_value * scale) + zero_point
+
+			0   → (0 * 0.00902) + (-0.8)   = -0.800
+			111 → (111 * 0.00902) + (-0.8) =  0.201
+
+			// ... etc
+
+LoRA (Low Rank Adaptation) - see image in the current folder to gain intuition
 
 	In fine-tuning, i.e., we are trying to customize LLM weights to our needs, what we are actually doing is updating the weights during a backward pass (similar to backprop algorithm)
 
 	For a given input, we generate an output from the vanilla LLM. If the output is different than the one we expected, we calculate the difference, and backpropagate the gradients. We do this repeatedly on our dataset until we are satisfied with the LLM output.
 
-	LoRA, is a specialized form of fine-tuning wherein we only update a select set of weights instead of all of them. These weights can be specific to attention-blocks of LLM, or some handpicked layers of the network. This way, we only have to capture these specific weights which are going to updated as part of our backward pass. Not only is the fine-tuning faster, but we can also consume less space to store our fine-tuned weights. In practicse these weights are typically 1-2% of the entire weights.
+	LoRA, is a specialized form of fine-tuning wherein we only update a select set of weights instead of all of them. These weights can be specific to attention-blocks of LLM, or some handpicked layers of the network. This way, we only have to capture these specific weights which are going to be updated as part of our backward pass. Not only is the fine-tuning faster, but we can also consume less space to store our fine-tuned weights. In practicse these weights are typically 1-2% of the entire weights.
 
 	Depending on the user's request we can dynamically swap the LoRA adapters (the fine-tuned weights) to achieve desired results
 
 	Multi-LoRA inference: In an enterprise we can let several teams/orgs fine-tune their specific LoRA adapters and use just a single base model. We are essentially exploiting the small footprint of the model. 
 
+Significance of the name: "LoRA"
+
+	Low-Rank refers to the linear algebra concept. When you decompose a weight update matrix ΔW into two smaller matrices (A and B), you're forcing it to have a low rank. Instead of updating a full d×d matrix with d² parameters, you use a d×r matrix and an r×d matrix, where r (the rank) is much smaller than d. This dramatically reduces parameters while still capturing meaningful adaptations.
+
+	Adaptation signals that you're not retraining the model from scratch. You're adapting a frozen pretrained model to a new task by learning only these small low-rank updates.
